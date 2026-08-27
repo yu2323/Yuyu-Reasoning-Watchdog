@@ -1,0 +1,52 @@
+name: Apply Reasoning Watchdog v0.3.3
+
+on:
+  push:
+    paths:
+      - '.github/workflows/apply-v033.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply staged patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply patches/v033-index-1.patch
+          git apply patches/v033-index-2.patch
+          git apply patches/v033-index-3.patch
+          git apply patches/v033-settings.patch
+          git apply patches/v033-readme.patch
+          git apply patches/v033-manifest.patch
+
+      - name: Validate plugin
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check index.js
+          python -m json.tool manifest.json >/dev/null
+          grep -q '"version": "0.3.3"' manifest.json
+          grep -q 'Reasoning Watchdog · v0.3.3' index.js
+          grep -q '【思维监工｜本轮锚定】' index.js
+
+      - name: Commit release and remove staging patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add index.js settings.html README.md manifest.json
+          git rm patches/v033-index-1.patch patches/v033-index-2.patch patches/v033-index-3.patch patches/v033-settings.patch patches/v033-readme.patch patches/v033-manifest.patch
+          git rm .github/workflows/apply-v033.yml
+          git commit -m 'release: Reasoning Watchdog v0.3.3 anchor and monitor calibration'
+          git push origin HEAD:main
