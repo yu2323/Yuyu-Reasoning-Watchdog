@@ -1,0 +1,33 @@
+--- a/settings.html
++++ b/settings.html
+@@ -6,11 +6,11 @@
+     </div>
+     <div class="inline-drawer-content yrw-settings-body" style="padding-top: 5px;">
+       <div class="yrw-settings-version-row flex-container justifySpaceBetween alignItemCenter">
+-        <div class="text_muted">v0.3.1 · 监测口径修正版</div>
++        <div class="text_muted">v0.3.3 · 锚定题卡实验</div>
+         <div class="text_muted">单轮题卡实验</div>
+       </div>
+ 
+-      <p class="yrw-settings-note">本地实时读取 reasoning 并计算回环。v0.3.1 继续保留单轮题卡实验，并修正监控状态：消息落地可兜底结束；悬浮在其他原生 Popup 打开时自动避让；面板区分“消息卡片报告 T”与“可见 reasoning 的本地估算（≈）”。</p>
++      <p class="yrw-settings-note">本地实时读取 reasoning 并计算回环。v0.3.3 继承 v0.3.2 的状态/口径修正，只把固定题卡改成“本轮推进锚点”：阻止为了考虑周全不断开新支线、枚举远期后果和假设树；不改回环算法，也不自动停止生成。</p>
+ 
+       <label class="checkbox_label">
+         <input id="yrw_enabled" type="checkbox" />
+@@ -56,14 +56,14 @@
+         <div class="yrw-setting-row">
+           <label for="yrw_thinking_guide_mode"><b>题卡模式</b> <small id="yrw_guide_status">等待下一次生成</small></label>
+           <select id="yrw_thinking_guide_mode" class="text_pole">
+-            <option value="fixed">固定题卡（先测这个）</option>
++            <option value="fixed">锚定题卡（推荐先测）</option>
+             <option value="custom">自定义题卡</option>
+           </select>
+         </div>
+         <div id="yrw_custom_guide_wrap" class="yrw-setting-row">
+           <label for="yrw_custom_thinking_guide"><b>自定义题卡</b></label>
+           <textarea id="yrw_custom_thinking_guide" class="text_pole textarea_compact" rows="6" maxlength="1200" placeholder="写你想让哈基米在内部思考时核对的问题……"></textarea>
+-          <button id="yrw_restore_fixed_guide" type="button" class="menu_button">把固定题卡复制到这里</button>
++          <button id="yrw_restore_fixed_guide" type="button" class="menu_button">把锚定题卡复制到这里</button>
+         </div>
+         <div class="yrw-setting-row">
+           <label for="yrw_guide_preview"><b>实际将喂给本轮模型的题卡</b></label>
