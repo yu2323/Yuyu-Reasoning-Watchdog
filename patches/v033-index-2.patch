@@ -1,0 +1,272 @@
+--- a/index.js
++++ b/index.js
+@@ -463,31 +555,96 @@
+     return '';
+ }
+ 
+-function estimateBodyChars() {
++function readLatestBodyText() {
+     let raw = '';
++    let unchangedBaseline = false;
+     try {
+-        const ctx = SillyTavern.getContext();
+-        const chat = Array.isArray(ctx?.chat) ? ctx.chat : [];
+-        for (let i = chat.length - 1; i >= Math.max(0, chat.length - 4); i--) {
+-            const msg = chat[i];
+-            if (msg && !msg.is_user && typeof msg.mes === 'string') {
+-                raw = msg.mes;
+-                break;
+-            }
+-        }
++        const { msg, id } = latestAssistantMessage();
++        unchangedBaseline = runtime.active
++            && id !== null
++            && id === runtime.baselineAssistantId
++            && String(msg?.mes || '') === runtime.baselineAssistantMes;
++        if (!unchangedBaseline && msg && typeof msg.mes === 'string') raw = msg.mes;
+     } catch { /* DOM fallback below */ }
+ 
++    if (unchangedBaseline) return '';
+     if (!raw) {
+-        const messages = document.querySelectorAll('#chat .mes:not([is_user="true"]) .mes_text');
+-        raw = messages.length ? messages[messages.length - 1].textContent || '' : '';
++        let candidate = null;
++        if (runtime.latestMessageId !== null) candidate = document.querySelector(`#chat .mes[mesid="${runtime.latestMessageId}"] .mes_text`);
++        if (!candidate) {
++            const messages = [...document.querySelectorAll('#chat .mes:not([is_user="true"]) .mes_text')];
++            candidate = messages[messages.length - 1] || null;
++        }
++        raw = candidate?.textContent || '';
+     }
+ 
+     const contentMatch = raw.match(/<content[^>]*>([\s\S]*?)<\/content>/i);
+     if (contentMatch) raw = contentMatch[1];
+     else raw = raw.replace(/<details[\s\S]*?<\/details>/gi, ' ');
+ 
+-    raw = raw.replace(/<[^>]+>/g, ' ').replace(/&nbsp;/gi, ' ').replace(/\s+/g, ' ').trim();
+-    return raw.replace(/\s/g, '').length;
++    return raw.replace(/<[^>]+>/g, ' ').replace(/&nbsp;/gi, ' ').replace(/\s+/g, ' ').trim();
++}
++
++function updateBodySnapshot() {
++    const text = readLatestBodyText();
++    const chars = text.replace(/\s/g, '').length;
++    if (chars !== runtime.latestBodyChars || text !== runtime.latestBodyText) {
++        runtime.latestBodyChars = chars;
++        runtime.latestBodyText = text;
++        runtime.lastBodyChangedAt = Date.now();
++    }
++    return chars;
++}
++
++function estimateBodyChars() {
++    return updateBodySnapshot();
++}
++
++function findFinishReasonInObject(obj, depth = 0, seen = new Set()) {
++    if (!obj || typeof obj !== 'object' || depth > 4 || seen.has(obj)) return '';
++    seen.add(obj);
++    for (const [key, value] of Object.entries(obj)) {
++        const k = String(key).replace(/[^a-z0-9]/gi, '').toLowerCase();
++        if (/(finishreason|stopreason|terminationreason|finishstatus)/.test(k) && (typeof value === 'string' || typeof value === 'number')) {
++            return String(value);
++        }
++    }
++    for (const value of Object.values(obj)) {
++        if (value && typeof value === 'object') {
++            const found = findFinishReasonInObject(value, depth + 1, seen);
++            if (found) return found;
++        }
++    }
++    return '';
++}
++
++function detectTruncation() {
++    const { msg } = latestAssistantMessage();
++    const finishReason = findFinishReasonInObject(msg || {});
++    const normalizedReason = finishReason.toLowerCase();
++    if (/(max.?tokens?|token.?limit|length)/i.test(normalizedReason)) {
++        return { suspected: true, reason: `结束原因：${finishReason}`, finishReason };
++    }
++    if (/(safety|blocked|recitation|prohibited)/i.test(normalizedReason)) {
++        return { suspected: true, reason: `生成被中止：${finishReason}`, finishReason };
++    }
++
++    const text = String(runtime.latestBodyText || readLatestBodyText()).trim();
++    if (text.length < 180) return { suspected: false, reason: '', finishReason };
++    const tail = text.replace(/[\s*_~`]+$/g, '');
++    if (!tail) return { suspected: false, reason: '', finishReason };
++    const last = tail.at(-1) || '';
++    const hasTerminal = /[。！？!?…；;：:」』”’"'）)\]】}>]$/.test(last);
++    if (hasTerminal) return { suspected: false, reason: '', finishReason };
++
++    const lastClause = tail.slice(-48);
++    const wordMatch = lastClause.match(/[A-Za-z]+$/);
++    const looksMidWord = /[A-Za-z0-9]$/.test(last) && !!wordMatch && wordMatch[0].length >= 3;
++    const longOpenClause = !/[。！？!?…；;：:]/.test(lastClause) && lastClause.length >= 28;
++    if (looksMidWord || longOpenClause) {
++        return { suspected: true, reason: '正文停止在未闭合句尾，疑似被长度/上游中止截断。', finishReason };
++    }
++    return { suspected: false, reason: '', finishReason };
+ }
+ 
+ function statusLabel(level) {
+@@ -522,30 +679,45 @@
+ 
+ function poll() {
+     if (!settings().enabled) return;
++    const now = Date.now();
+     const reasoning = findCurrentReasoning();
++    updateBodySnapshot();
+     readReportedThinkingTokens();
+     syncFloatOcclusion();
+-    if (!reasoning || reasoning.length === runtime.lastReasoningChars) {
+-        if (runtime.active) {
+-            if (runtime.reasoningStartedAt) {
+-                const end = runtime.reasoningDoneAt || Date.now();
+-                runtime.analysis.elapsedMs = Math.max(0, end - runtime.reasoningStartedAt);
+-            } else {
+-                runtime.analysis.elapsedMs = 0;
+-            }
+-            updateUI();
++
++    if (reasoning && reasoning.length !== runtime.lastReasoningChars) {
++        if (!runtime.reasoningStartedAt) runtime.reasoningStartedAt = now;
++        runtime.lastReasoningChangedAt = now;
++        runtime.lastReasoning = reasoning;
++        runtime.lastReasoningChars = reasoning.length;
++        runtime.analysis = analyzeReasoning(reasoning);
++        pushSample(runtime.analysis);
++        maybeToast(runtime.analysis);
++        void refreshVisibleTokenCount(reasoning);
++    } else if (runtime.active) {
++        if (runtime.reasoningStartedAt) {
++            const end = runtime.reasoningDoneAt || now;
++            runtime.analysis.elapsedMs = Math.max(0, end - runtime.reasoningStartedAt);
++        } else {
++            runtime.analysis.elapsedMs = 0;
+         }
+-        return;
+     }
+ 
+-    const now = Date.now();
+-    if (!runtime.reasoningStartedAt) runtime.reasoningStartedAt = now;
+-    runtime.lastReasoningChangedAt = now;
+-    runtime.lastReasoning = reasoning;
+-    runtime.lastReasoningChars = reasoning.length;
+-    runtime.analysis = analyzeReasoning(reasoning);
+-    pushSample(runtime.analysis);
+-    maybeToast(runtime.analysis);
++    // Official ST exposes is_send_press as the live generation flag. Some mobile shells
++    // miss GENERATION_ENDED / MESSAGE_RECEIVED, so host-idle becomes a second completion path.
++    if (runtime.active && !runtime.finalizing) {
++        const latest = latestAssistantMessage();
++        const hasRunAssistant = latest.id !== null && !(latest.id === runtime.baselineAssistantId && String(latest.msg?.mes || '') === runtime.baselineAssistantMes);
++        if (is_send_press) {
++            runtime.hostIdleSince = 0;
++        } else if (hasRunAssistant && runtime.latestBodyChars > 0 && now - runtime.startedAt > 900) {
++            if (!runtime.hostIdleSince) runtime.hostIdleSince = now;
++            if (now - runtime.hostIdleSince >= 850) {
++                finishMonitoring('', 'host-idle');
++                return;
++            }
++        }
++    }
+     updateUI();
+ }
+ 
+@@ -562,9 +734,21 @@
+     runtime.lastReasoning = '';
+     runtime.lastReasoningChars = 0;
+     runtime.latestBodyChars = 0;
++    runtime.latestBodyText = '';
++    runtime.lastBodyChangedAt = 0;
++    runtime.lastStreamTokenAt = 0;
++    runtime.hostIdleSince = 0;
++    runtime.finishSource = '';
+     runtime.latestMessageId = null;
+     runtime.reportedThinkingTokens = null;
+     runtime.reportedTokenSource = '';
++    runtime.lastCardScanAt = 0;
++    runtime.visibleTokenCount = null;
++    runtime.visibleTokenSource = '';
++    runtime.visibleTokenForChars = 0;
++    runtime.visibleTokenScanAt = 0;
++    runtime.visibleTokenSeq++;
++    runtime.truncation = { suspected: false, reason: '', finishReason: '' };
+     const baseline = latestAssistantMessage();
+     runtime.baselineAssistantId = baseline.id;
+     runtime.baselineAssistantMes = String(baseline.msg?.mes || '');
+@@ -578,9 +762,10 @@
+     updateUI();
+ }
+ 
+-function finishMonitoring(reasoningFromEvent = '') {
++function finishMonitoring(reasoningFromEvent = '', source = 'event') {
+     if (runtime.finalizing || !runtime.active) return;
+     runtime.finalizing = true;
++    runtime.finishSource = source;
+     if (reasoningFromEvent && reasoningFromEvent.length >= runtime.lastReasoningChars) {
+         runtime.lastReasoning = reasoningFromEvent;
+         runtime.lastReasoningChars = reasoningFromEvent.length;
+@@ -590,7 +775,7 @@
+         poll();
+     }
+ 
+-    setTimeout(() => {
++    setTimeout(async () => {
+         runtime.active = false;
+         clearInterval(runtime.timer);
+         runtime.timer = null;
+@@ -601,13 +786,20 @@
+         runtime.analysis.elapsedMs = savedReasoningDuration ?? (runtime.reasoningStartedAt
+             ? Math.max(0, (runtime.reasoningDoneAt || Date.now()) - runtime.reasoningStartedAt)
+             : 0);
+-        runtime.analysis.statusText = runtime.analysis.reasoningChars ? `已完成 · ${statusLabel(runtime.analysis.level)}` : '已完成';
+         runtime.latestBodyChars = estimateBodyChars();
+-        readReportedThinkingTokens();
++        if (runtime.lastReasoning) await refreshVisibleTokenCount(runtime.lastReasoning, true);
++        readReportedThinkingTokens(true);
++        runtime.truncation = detectTruncation();
++        runtime.analysis.statusText = runtime.truncation.suspected
++            ? '已结束 · 疑似截断'
++            : runtime.analysis.reasoningChars ? `已完成 · ${statusLabel(runtime.analysis.level)}` : '已完成';
++        if (runtime.truncation.suspected && settings().toastEnabled && typeof toastr !== 'undefined') {
++            toastr.warning(runtime.truncation.reason, '🧠 Yuyu Watchdog · 疑似截断');
++        }
+         saveRunSummary();
+         updateUI();
+         runtime.finalizing = false;
+-    }, 280);
++    }, 320);
+ }
+ 
+ function saveRunSummary() {
+@@ -617,12 +809,18 @@
+         at: Date.now(),
+         reasoningChars: runtime.analysis.reasoningChars,
+         approxTokens: runtime.analysis.approxTokens,
++        visibleTokenCount: runtime.visibleTokenCount,
++        visibleTokenSource: runtime.visibleTokenSource,
+         reportedThinkingTokens: runtime.reportedThinkingTokens,
+         reportedTokenSource: runtime.reportedTokenSource,
+         score: runtime.analysis.score,
+         level: runtime.analysis.level,
+         durationMs: runtime.analysis.elapsedMs,
+         bodyChars: runtime.latestBodyChars,
++        suspectedTruncation: !!runtime.truncation?.suspected,
++        truncationReason: runtime.truncation?.reason || '',
++        finishReason: runtime.truncation?.finishReason || '',
++        finishSource: runtime.finishSource || '',
+         thinkingGuide: runtime.guideInjectedThisRun ? String(s.thinkingGuideMode || 'fixed') : 'off',
+     });
+     s.history = s.history.slice(0, MAX_HISTORY);
+@@ -644,7 +842,7 @@
+           <div class="yrw-brand-mark"><i class="fa-solid fa-brain"></i></div>
+           <div class="yrw-brand-copy">
+             <div class="yrw-title">思维监工</div>
+-            <div class="yrw-subtitle">Reasoning Watchdog · v0.3.1</div>
++            <div class="yrw-subtitle">Reasoning Watchdog · v0.3.3</div>
+           </div>
+         </div>
+         <div class="yrw-head-actions">
