@@ -1,0 +1,12 @@
+{
+  "display_name": "Yuyu Reasoning Watchdog",
+  "loading_order": 90,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "Yuyu Lab",
+  "version": "0.3.1",
+  "homePage": "https://github.com/yu2323/Yuyu-Reasoning-Watchdog",
+  "auto_update": false
+}
