@@ -1,9 +1,9 @@
-import { eventSource, event_types, saveSettingsDebounced } from '../../../../script.js';
+import { eventSource, event_types, saveSettingsDebounced, is_send_press } from '../../../../script.js';
 import { extension_settings, renderExtensionTemplateAsync } from '../../../extensions.js';
 import { Popup, POPUP_TYPE, POPUP_RESULT } from '../../../popup.js';
 
 const MODULE = 'yuyu_reasoning_watchdog';
-const EXTENSION_FOLDER = decodeURIComponent(new URL('.', import.meta.url).pathname.split('/').filter(Boolean).pop() || 'Yuyu-Reasoning-Watchdog-v0.3.1');
+const EXTENSION_FOLDER = decodeURIComponent(new URL('.', import.meta.url).pathname.split('/').filter(Boolean).pop() || 'Yuyu-Reasoning-Watchdog-v0.3.3');
 const POLL_MS = 520;
 const MAX_HISTORY = 12;
 const MAX_SAMPLES = 42;
@@ -13,15 +13,19 @@ let popupRoot = null;
 let floatEl = null;
 
 const GUIDE_MAX_CHARS = 1200;
-const FIXED_THINKING_GUIDE = `【思维监工｜本轮内部检查】
-不要逐题展开，只在内部核对：
-1. 哪些事实已经成立，不必重新判定？
-2. 还剩哪个具体未决变量会影响本轮推进？
-3. 角色此刻的理解、情绪与行动，是否有既有设定、已知信息与当前动机支持？
-4. 是否把一次情境反应放大成稳定人格，或为了推进剧情临时提高角色强度？
-5. 最近一段推理增加了什么新信息，还是只在换说法重复已有结论？
-6. 若已无具体未决变量，结束分析并完成本轮输出。
-不要在最终输出中复述本检查题。`;
+const FIXED_THINKING_GUIDE = `【思维监工｜本轮锚定】
+只在内部执行，不要在最终输出中复述。
+
+先确定一个“本轮推进锚点”：这一轮真正需要决定的下一步是什么？
+之后只保留会直接改变这个下一步的判断：
+1. 已成立事实只引用，不重新证明；已经排除的解释不要换说法再开一次。
+2. 每个新推断都要有当前设定、已知信息或现场事实支撑。没有新证据，不升级角色的人格、情绪、能力、立场或危险程度。
+3. 不为了“考虑周全”枚举所有可能性。背景联想、远期后果、备用假设、象征意义，以及与本轮推进锚点没有直接因果关系的支线，出现后立即丢弃。证据不足就保留未知，不展开假设树。
+4. 其他人物、环境、群像变量若会直接改变本轮下一步，必须纳入；这属于主问题，不算跑题。
+5. 每准备展开一个新主题前先问：它会改变本轮下一步吗？不会就回到推进锚点。
+6. 未决变量已经足以决定下一步时，立即结束分析并完成输出。
+
+目标不是少想，而是只想对本轮真正有决定作用的东西。`;
 
 const defaults = {
     enabled: true,
@@ -58,6 +62,18 @@ const runtime = {
     lastGuideText: '',
     reportedThinkingTokens: null,
     reportedTokenSource: '',
+    lastCardScanAt: 0,
+    visibleTokenCount: null,
+    visibleTokenSource: '',
+    visibleTokenForChars: 0,
+    visibleTokenScanAt: 0,
+    visibleTokenSeq: 0,
+    latestBodyText: '',
+    lastBodyChangedAt: 0,
+    lastStreamTokenAt: 0,
+    hostIdleSince: 0,
+    finishSource: '',
+    truncation: { suspected: false, reason: '', finishReason: '' },
     baselineAssistantId: null,
     baselineAssistantMes: '',
 };
@@ -189,7 +205,50 @@ function latestAssistantMessage() {
     return { msg: null, id: null };
 }
 
-function readReportedThinkingTokens() {
+function extractCardTValues(text) {
+    const source = String(text || '');
+    const values = [];
+    const patterns = [
+        /(?:^|[^\w])([0-9]{2,7}(?:,[0-9]{3})*)\s*T(?![\w])/gi,
+        /(?:^|[^\w])([0-9]{2,7}(?:,[0-9]{3})*)\s*(?:tokens?|tok)(?![\w])/gi,
+    ];
+    for (const pattern of patterns) {
+        for (const match of source.matchAll(pattern)) {
+            const n = Number(match[1].replace(/,/g, ''));
+            if (Number.isFinite(n) && n >= 20 && n <= 500000) values.push(n);
+        }
+    }
+    return values;
+}
+
+function readMessageChromeTValues(mes) {
+    if (!mes) return [];
+    const values = [];
+    const excluded = '.mes_text,.mes_reasoning,.mes_reasoning_details,textarea,pre,code,#yrw-float';
+    const nodes = [mes, ...mes.querySelectorAll('*')].filter(el => !el.closest?.(excluded)).slice(0, 180);
+
+    const clone = mes.cloneNode(true);
+    clone.querySelectorAll(excluded).forEach(el => el.remove());
+    values.push(...extractCardTValues(clone.textContent || ''));
+
+    for (const el of nodes) {
+        for (const attr of [...(el.attributes || [])]) {
+            if (!/(data|title|aria|token|stat|count|usage|gen)/i.test(attr.name)) continue;
+            values.push(...extractCardTValues(attr.value));
+        }
+        for (const pseudo of ['::before', '::after']) {
+            try {
+                const content = getComputedStyle(el, pseudo)?.content;
+                if (content && content !== 'none' && content !== 'normal') {
+                    values.push(...extractCardTValues(content.replace(/^['"]|['"]$/g, '')));
+                }
+            } catch { /* pseudo-style unavailable */ }
+        }
+    }
+    return values;
+}
+
+function readReportedThinkingTokens(force = false) {
     const { msg, id } = latestAssistantMessage();
     const isUnchangedBaseline = runtime.active
         && id !== null
@@ -205,8 +264,12 @@ function readReportedThinkingTokens() {
         }
     }
 
-    // Some mobile themes/extensions render a generation token badge such as "5091T"
-    // without persisting it into chat.extra. Read only the message chrome, never正文/reasoning.
+    const now = Date.now();
+    if (!force && now - runtime.lastCardScanAt < 1200) return runtime.reportedThinkingTokens;
+    runtime.lastCardScanAt = now;
+
+    // Some mobile themes render the badge via data-* attributes or CSS pseudo-elements,
+    // so textContent alone is insufficient. Scan only message chrome, never正文/reasoning.
     let mes = null;
     if (id !== null) mes = document.querySelector(`#chat .mes[mesid="${id}"]`);
     if (!mes) {
@@ -215,16 +278,11 @@ function readReportedThinkingTokens() {
     }
     if (!mes) return runtime.reportedThinkingTokens;
 
-    const clone = mes.cloneNode(true);
-    clone.querySelectorAll('.mes_text,.mes_reasoning,.mes_reasoning_details,textarea,pre,code,#yrw-float').forEach(el => el.remove());
-    const chromeText = String(clone.textContent || '').replace(/\s+/g, ' ');
-    const hits = [...chromeText.matchAll(/(?:^|[^\w])([0-9]{2,7}(?:,[0-9]{3})*)\s*T(?![\w])/gi)]
-        .map(m => Number(m[1].replace(/,/g, '')))
-        .filter(n => Number.isFinite(n) && n >= 20 && n <= 500000);
+    const hits = readMessageChromeTValues(mes);
     if (hits.length) {
         const value = Math.max(...hits);
         runtime.reportedThinkingTokens = value;
-        runtime.reportedTokenSource = 'message-card T';
+        runtime.reportedTokenSource = 'message-card T / chrome';
         return value;
     }
     return runtime.reportedThinkingTokens;
@@ -298,6 +356,40 @@ function approxTokens(text) {
     const cjk = (text.match(/[\u3400-\u9fff]/g) || []).length;
     const other = Math.max(0, text.length - cjk);
     return Math.round(cjk / 1.25 + other / 4.05);
+}
+
+async function refreshVisibleTokenCount(text, force = false) {
+    const raw = String(text || '');
+    if (!raw) {
+        runtime.visibleTokenCount = null;
+        runtime.visibleTokenForChars = 0;
+        return null;
+    }
+    const now = Date.now();
+    if (!force && runtime.visibleTokenCount !== null
+        && raw.length - runtime.visibleTokenForChars < 320
+        && now - runtime.visibleTokenScanAt < 1800) {
+        return runtime.visibleTokenCount;
+    }
+
+    let counter = null;
+    try { counter = SillyTavern.getContext()?.getTokenCountAsync; } catch { /* fallback below */ }
+    if (typeof counter !== 'function') return null;
+
+    const seq = ++runtime.visibleTokenSeq;
+    runtime.visibleTokenScanAt = now;
+    try {
+        const value = Number(await counter(raw));
+        if (seq !== runtime.visibleTokenSeq || !Number.isFinite(value) || value < 0) return runtime.visibleTokenCount;
+        runtime.visibleTokenCount = Math.round(value);
+        runtime.visibleTokenForChars = raw.length;
+        runtime.visibleTokenSource = 'SillyTavern tokenizer';
+        updateUI();
+        return runtime.visibleTokenCount;
+    } catch (error) {
+        console.debug('[YRW] ST visible token count failed:', error);
+        return null;
+    }
 }
 
 function basicWords(text) {
@@ -463,31 +555,96 @@ function findCurrentReasoning() {
     return '';
 }
 
-function estimateBodyChars() {
+function readLatestBodyText() {
     let raw = '';
+    let unchangedBaseline = false;
     try {
-        const ctx = SillyTavern.getContext();
-        const chat = Array.isArray(ctx?.chat) ? ctx.chat : [];
-        for (let i = chat.length - 1; i >= Math.max(0, chat.length - 4); i--) {
-            const msg = chat[i];
-            if (msg && !msg.is_user && typeof msg.mes === 'string') {
-                raw = msg.mes;
-                break;
-            }
-        }
+        const { msg, id } = latestAssistantMessage();
+        unchangedBaseline = runtime.active
+            && id !== null
+            && id === runtime.baselineAssistantId
+            && String(msg?.mes || '') === runtime.baselineAssistantMes;
+        if (!unchangedBaseline && msg && typeof msg.mes === 'string') raw = msg.mes;
     } catch { /* DOM fallback below */ }
 
+    if (unchangedBaseline) return '';
     if (!raw) {
-        const messages = document.querySelectorAll('#chat .mes:not([is_user="true"]) .mes_text');
-        raw = messages.length ? messages[messages.length - 1].textContent || '' : '';
+        let candidate = null;
+        if (runtime.latestMessageId !== null) candidate = document.querySelector(`#chat .mes[mesid="${runtime.latestMessageId}"] .mes_text`);
+        if (!candidate) {
+            const messages = [...document.querySelectorAll('#chat .mes:not([is_user="true"]) .mes_text')];
+            candidate = messages[messages.length - 1] || null;
+        }
+        raw = candidate?.textContent || '';
     }
 
     const contentMatch = raw.match(/<content[^>]*>([\s\S]*?)<\/content>/i);
     if (contentMatch) raw = contentMatch[1];
     else raw = raw.replace(/<details[\s\S]*?<\/details>/gi, ' ');
 
-    raw = raw.replace(/<[^>]+>/g, ' ').replace(/&nbsp;/gi, ' ').replace(/\s+/g, ' ').trim();
-    return raw.replace(/\s/g, '').length;
+    return raw.replace(/<[^>]+>/g, ' ').replace(/&nbsp;/gi, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function updateBodySnapshot() {
+    const text = readLatestBodyText();
+    const chars = text.replace(/\s/g, '').length;
+    if (chars !== runtime.latestBodyChars || text !== runtime.latestBodyText) {
+        runtime.latestBodyChars = chars;
+        runtime.latestBodyText = text;
+        runtime.lastBodyChangedAt = Date.now();
+    }
+    return chars;
+}
+
+function estimateBodyChars() {
+    return updateBodySnapshot();
+}
+
+function findFinishReasonInObject(obj, depth = 0, seen = new Set()) {
+    if (!obj || typeof obj !== 'object' || depth > 4 || seen.has(obj)) return '';
+    seen.add(obj);
+    for (const [key, value] of Object.entries(obj)) {
+        const k = String(key).replace(/[^a-z0-9]/gi, '').toLowerCase();
+        if (/(finishreason|stopreason|terminationreason|finishstatus)/.test(k) && (typeof value === 'string' || typeof value === 'number')) {
+            return String(value);
+        }
+    }
+    for (const value of Object.values(obj)) {
+        if (value && typeof value === 'object') {
+            const found = findFinishReasonInObject(value, depth + 1, seen);
+            if (found) return found;
+        }
+    }
+    return '';
+}
+
+function detectTruncation() {
+    const { msg } = latestAssistantMessage();
+    const finishReason = findFinishReasonInObject(msg || {});
+    const normalizedReason = finishReason.toLowerCase();
+    if (/(max.?tokens?|token.?limit|length)/i.test(normalizedReason)) {
+        return { suspected: true, reason: `结束原因：${finishReason}`, finishReason };
+    }
+    if (/(safety|blocked|recitation|prohibited)/i.test(normalizedReason)) {
+        return { suspected: true, reason: `生成被中止：${finishReason}`, finishReason };
+    }
+
+    const text = String(runtime.latestBodyText || readLatestBodyText()).trim();
+    if (text.length < 180) return { suspected: false, reason: '', finishReason };
+    const tail = text.replace(/[\s*_~`]+$/g, '');
+    if (!tail) return { suspected: false, reason: '', finishReason };
+    const last = tail.at(-1) || '';
+    const hasTerminal = /[。！？!?…；;：:」』”’"'）)\]】}>]$/.test(last);
+    if (hasTerminal) return { suspected: false, reason: '', finishReason };
+
+    const lastClause = tail.slice(-48);
+    const wordMatch = lastClause.match(/[A-Za-z]+$/);
+    const looksMidWord = /[A-Za-z0-9]$/.test(last) && !!wordMatch && wordMatch[0].length >= 3;
+    const longOpenClause = !/[。！？!?…；;：:]/.test(lastClause) && lastClause.length >= 28;
+    if (looksMidWord || longOpenClause) {
+        return { suspected: true, reason: '正文停止在未闭合句尾，疑似被长度/上游中止截断。', finishReason };
+    }
+    return { suspected: false, reason: '', finishReason };
 }
 
 function statusLabel(level) {
@@ -522,30 +679,45 @@ function pushSample(a) {
 
 function poll() {
     if (!settings().enabled) return;
+    const now = Date.now();
     const reasoning = findCurrentReasoning();
+    updateBodySnapshot();
     readReportedThinkingTokens();
     syncFloatOcclusion();
-    if (!reasoning || reasoning.length === runtime.lastReasoningChars) {
-        if (runtime.active) {
-            if (runtime.reasoningStartedAt) {
-                const end = runtime.reasoningDoneAt || Date.now();
-                runtime.analysis.elapsedMs = Math.max(0, end - runtime.reasoningStartedAt);
-            } else {
-                runtime.analysis.elapsedMs = 0;
-            }
-            updateUI();
+
+    if (reasoning && reasoning.length !== runtime.lastReasoningChars) {
+        if (!runtime.reasoningStartedAt) runtime.reasoningStartedAt = now;
+        runtime.lastReasoningChangedAt = now;
+        runtime.lastReasoning = reasoning;
+        runtime.lastReasoningChars = reasoning.length;
+        runtime.analysis = analyzeReasoning(reasoning);
+        pushSample(runtime.analysis);
+        maybeToast(runtime.analysis);
+        void refreshVisibleTokenCount(reasoning);
+    } else if (runtime.active) {
+        if (runtime.reasoningStartedAt) {
+            const end = runtime.reasoningDoneAt || now;
+            runtime.analysis.elapsedMs = Math.max(0, end - runtime.reasoningStartedAt);
+        } else {
+            runtime.analysis.elapsedMs = 0;
         }
-        return;
     }
 
-    const now = Date.now();
-    if (!runtime.reasoningStartedAt) runtime.reasoningStartedAt = now;
-    runtime.lastReasoningChangedAt = now;
-    runtime.lastReasoning = reasoning;
-    runtime.lastReasoningChars = reasoning.length;
-    runtime.analysis = analyzeReasoning(reasoning);
-    pushSample(runtime.analysis);
-    maybeToast(runtime.analysis);
+    // Official ST exposes is_send_press as the live generation flag. Some mobile shells
+    // miss GENERATION_ENDED / MESSAGE_RECEIVED, so host-idle becomes a second completion path.
+    if (runtime.active && !runtime.finalizing) {
+        const latest = latestAssistantMessage();
+        const hasRunAssistant = latest.id !== null && !(latest.id === runtime.baselineAssistantId && String(latest.msg?.mes || '') === runtime.baselineAssistantMes);
+        if (is_send_press) {
+            runtime.hostIdleSince = 0;
+        } else if (hasRunAssistant && runtime.latestBodyChars > 0 && now - runtime.startedAt > 900) {
+            if (!runtime.hostIdleSince) runtime.hostIdleSince = now;
+            if (now - runtime.hostIdleSince >= 850) {
+                finishMonitoring('', 'host-idle');
+                return;
+            }
+        }
+    }
     updateUI();
 }
 
@@ -562,9 +734,21 @@ function startMonitoring() {
     runtime.lastReasoning = '';
     runtime.lastReasoningChars = 0;
     runtime.latestBodyChars = 0;
+    runtime.latestBodyText = '';
+    runtime.lastBodyChangedAt = 0;
+    runtime.lastStreamTokenAt = 0;
+    runtime.hostIdleSince = 0;
+    runtime.finishSource = '';
     runtime.latestMessageId = null;
     runtime.reportedThinkingTokens = null;
     runtime.reportedTokenSource = '';
+    runtime.lastCardScanAt = 0;
+    runtime.visibleTokenCount = null;
+    runtime.visibleTokenSource = '';
+    runtime.visibleTokenForChars = 0;
+    runtime.visibleTokenScanAt = 0;
+    runtime.visibleTokenSeq++;
+    runtime.truncation = { suspected: false, reason: '', finishReason: '' };
     const baseline = latestAssistantMessage();
     runtime.baselineAssistantId = baseline.id;
     runtime.baselineAssistantMes = String(baseline.msg?.mes || '');
@@ -578,9 +762,10 @@ function startMonitoring() {
     updateUI();
 }
 
-function finishMonitoring(reasoningFromEvent = '') {
+function finishMonitoring(reasoningFromEvent = '', source = 'event') {
     if (runtime.finalizing || !runtime.active) return;
     runtime.finalizing = true;
+    runtime.finishSource = source;
     if (reasoningFromEvent && reasoningFromEvent.length >= runtime.lastReasoningChars) {
         runtime.lastReasoning = reasoningFromEvent;
         runtime.lastReasoningChars = reasoningFromEvent.length;
@@ -590,7 +775,7 @@ function finishMonitoring(reasoningFromEvent = '') {
         poll();
     }
 
-    setTimeout(() => {
+    setTimeout(async () => {
         runtime.active = false;
         clearInterval(runtime.timer);
         runtime.timer = null;
@@ -601,13 +786,20 @@ function finishMonitoring(reasoningFromEvent = '') {
         runtime.analysis.elapsedMs = savedReasoningDuration ?? (runtime.reasoningStartedAt
             ? Math.max(0, (runtime.reasoningDoneAt || Date.now()) - runtime.reasoningStartedAt)
             : 0);
-        runtime.analysis.statusText = runtime.analysis.reasoningChars ? `已完成 · ${statusLabel(runtime.analysis.level)}` : '已完成';
         runtime.latestBodyChars = estimateBodyChars();
-        readReportedThinkingTokens();
+        if (runtime.lastReasoning) await refreshVisibleTokenCount(runtime.lastReasoning, true);
+        readReportedThinkingTokens(true);
+        runtime.truncation = detectTruncation();
+        runtime.analysis.statusText = runtime.truncation.suspected
+            ? '已结束 · 疑似截断'
+            : runtime.analysis.reasoningChars ? `已完成 · ${statusLabel(runtime.analysis.level)}` : '已完成';
+        if (runtime.truncation.suspected && settings().toastEnabled && typeof toastr !== 'undefined') {
+            toastr.warning(runtime.truncation.reason, '🧠 Yuyu Watchdog · 疑似截断');
+        }
         saveRunSummary();
         updateUI();
         runtime.finalizing = false;
-    }, 280);
+    }, 320);
 }
 
 function saveRunSummary() {
@@ -617,12 +809,18 @@ function saveRunSummary() {
         at: Date.now(),
         reasoningChars: runtime.analysis.reasoningChars,
         approxTokens: runtime.analysis.approxTokens,
+        visibleTokenCount: runtime.visibleTokenCount,
+        visibleTokenSource: runtime.visibleTokenSource,
         reportedThinkingTokens: runtime.reportedThinkingTokens,
         reportedTokenSource: runtime.reportedTokenSource,
         score: runtime.analysis.score,
         level: runtime.analysis.level,
         durationMs: runtime.analysis.elapsedMs,
         bodyChars: runtime.latestBodyChars,
+        suspectedTruncation: !!runtime.truncation?.suspected,
+        truncationReason: runtime.truncation?.reason || '',
+        finishReason: runtime.truncation?.finishReason || '',
+        finishSource: runtime.finishSource || '',
         thinkingGuide: runtime.guideInjectedThisRun ? String(s.thinkingGuideMode || 'fixed') : 'off',
     });
     s.history = s.history.slice(0, MAX_HISTORY);
@@ -644,7 +842,7 @@ function buildPopupContent() {
           <div class="yrw-brand-mark"><i class="fa-solid fa-brain"></i></div>
           <div class="yrw-brand-copy">
             <div class="yrw-title">思维监工</div>
-            <div class="yrw-subtitle">Reasoning Watchdog · v0.3.1</div>
+            <div class="yrw-subtitle">Reasoning Watchdog · v0.3.3</div>
           </div>
         </div>
         <div class="yrw-head-actions">
@@ -758,8 +956,11 @@ function buildPopupContent() {
         if (!runtime.active) {
             runtime.analysis = emptyAnalysis();
             runtime.latestBodyChars = 0;
+            runtime.latestBodyText = '';
             runtime.lastReasoning = '';
             runtime.lastReasoningChars = 0;
+            runtime.visibleTokenCount = null;
+            runtime.truncation = { suspected: false, reason: '', finishReason: '' };
         }
         updateUI();
     });
@@ -1007,7 +1208,10 @@ function updateUI() {
     const reported = readReportedThinkingTokens();
     setText('yrw-token-main', reported !== null ? `${formatK(reported)}T` : '未捕获');
     setText('yrw-token-kind', reported !== null ? '卡片报告' : '卡片 T');
-    setText('yrw-visible-token', `可见≈${formatK(a.approxTokens || 0)} tok`);
+    const visibleTokens = runtime.visibleTokenCount;
+    setText('yrw-visible-token', visibleTokens !== null ? `可见 ${formatK(visibleTokens)} tok` : `可见≈${formatK(a.approxTokens || 0)} tok`);
+    const visibleTokenEl = q('yrw-visible-token');
+    if (visibleTokenEl) visibleTokenEl.title = visibleTokens !== null ? '由 SillyTavern 当前 tokenizer 计算。' : 'ST tokenizer 暂未返回，显示本地字符估算。';
     const tokenMain = q('yrw-token-main');
     if (tokenMain) tokenMain.title = reported !== null
         ? `来源：${runtime.reportedTokenSource || '消息卡片'}。这是宿主/主题显示的 T 值，不冒充 Gemini usageMetadata。`
@@ -1016,7 +1220,14 @@ function updateUI() {
     setText('yrw-time', formatTime(a.elapsedMs || 0));
     setText('yrw-repeat', `${Math.round((a.repeatRatio || 0) * 100)}%`);
     setText('yrw-novelty', `${Math.round((a.novelty ?? 1) * 100)}%`);
-    setText('yrw-body', runtime.latestBodyChars ? `${formatK(runtime.latestBodyChars)} 字符` : runtime.active ? '生成中' : '—');
+    const bodyLabel = runtime.active
+        ? (runtime.latestBodyChars ? `${formatK(runtime.latestBodyChars)} 字符 · 生成中` : '生成中')
+        : runtime.latestBodyChars
+            ? `${formatK(runtime.latestBodyChars)} 字符${runtime.truncation?.suspected ? ' · 疑似截断' : ''}`
+            : '—';
+    setText('yrw-body', bodyLabel);
+    const bodyEl = q('yrw-body');
+    if (bodyEl) bodyEl.title = runtime.truncation?.reason || '';
     setText('yrw-heading-loop', `标题回环 ${Math.round((a.headingLoop || 0) * 100)}%`);
     setText('yrw-alert-text', a.note || '尚未开始监控。');
 
@@ -1138,8 +1349,14 @@ async function mountSettings() {
 function bindEvents() {
     eventSource.makeLast(event_types.CHAT_COMPLETION_PROMPT_READY, injectThinkingGuide);
     eventSource.on(event_types.GENERATION_STARTED, startMonitoring);
-    eventSource.on(event_types.GENERATION_ENDED, () => finishMonitoring());
-    eventSource.on(event_types.GENERATION_STOPPED, () => finishMonitoring());
+    eventSource.on(event_types.GENERATION_ENDED, () => finishMonitoring('', 'generation-ended'));
+    eventSource.on(event_types.GENERATION_STOPPED, () => finishMonitoring('', 'generation-stopped'));
+    if (event_types.STREAM_TOKEN_RECEIVED) {
+        eventSource.on(event_types.STREAM_TOKEN_RECEIVED, () => {
+            runtime.lastStreamTokenAt = Date.now();
+            runtime.hostIdleSince = 0;
+        });
+    }
     eventSource.on(event_types.STREAM_REASONING_DONE, (reasoning, duration, messageId) => {
         if (typeof reasoning === 'string' && reasoning) {
             const now = Date.now();
@@ -1162,7 +1379,7 @@ function bindEvents() {
         setTimeout(() => {
             runtime.latestBodyChars = estimateBodyChars();
             readReportedThinkingTokens();
-            if (runtime.active && !runtime.finalizing) finishMonitoring();
+            if (runtime.active && !runtime.finalizing) finishMonitoring('', 'message-received');
             else updateUI();
         }, 420);
     });
@@ -1181,5 +1398,5 @@ jQuery(async () => {
     }, 2500);
     setInterval(syncFloatOcclusion, 650);
 
-    console.info('[YRW] Yuyu Reasoning Watchdog v0.3.1 loaded (native Popup + native extension drawer + one-shot thinking guide experiment).');
+    console.info('[YRW] Yuyu Reasoning Watchdog v0.3.3 loaded (native Popup + native extension drawer + one-shot anchor guide experiment).');
 });
