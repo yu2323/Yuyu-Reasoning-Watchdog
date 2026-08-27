@@ -18,16 +18,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Apply staged patches
+      - name: Apply staged index patches
         shell: bash
         run: |
           set -euo pipefail
           git apply patches/v033-index-1.patch
           git apply patches/v033-index-2.patch
           git apply patches/v033-index-3.patch
-          git apply patches/v033-settings.patch
-          git apply patches/v033-readme.patch
-          git apply patches/v033-manifest.patch
 
       - name: Validate plugin
         shell: bash
@@ -38,6 +35,8 @@ jobs:
           grep -q '"version": "0.3.3"' manifest.json
           grep -q 'Reasoning Watchdog · v0.3.3' index.js
           grep -q '【思维监工｜本轮锚定】' index.js
+          grep -q 'v0.3.3 · 锚定题卡实验' settings.html
+          grep -q '当前版本：\*\*v0.3.3\*\*' README.md
 
       - name: Commit release and remove staging patches
         shell: bash
@@ -45,7 +44,7 @@ jobs:
           set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add index.js settings.html README.md manifest.json
+          git add index.js
           git rm patches/v033-index-1.patch patches/v033-index-2.patch patches/v033-index-3.patch patches/v033-settings.patch patches/v033-readme.patch patches/v033-manifest.patch
           git rm .github/workflows/apply-v033.yml
           git commit -m 'release: Reasoning Watchdog v0.3.3 anchor and monitor calibration'
