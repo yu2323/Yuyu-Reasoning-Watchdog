@@ -6,11 +6,11 @@
     </div>
     <div class="inline-drawer-content yrw-settings-body" style="padding-top: 5px;">
       <div class="yrw-settings-version-row flex-container justifySpaceBetween alignItemCenter">
-        <div class="text_muted">v0.3.3 · 锚定题卡实验</div>
-        <div class="text_muted">单轮题卡实验</div>
+        <div class="text_muted">v0.3.4 · Topic Drift 观察版</div>
+        <div class="text_muted">锚点偏离实验</div>
       </div>
 
-      <p class="yrw-settings-note">本地实时读取 reasoning 并计算回环。v0.3.3 继承 v0.3.2 的状态/口径修正，只把固定题卡改成“本轮推进锚点”：阻止为了考虑周全不断开新支线、枚举远期后果和假设树；不改回环算法，也不自动停止生成。</p>
+      <p class="yrw-settings-note">本地实时读取 reasoning。v0.3.4 保留原回环指数与 v0.3.3 锚定题卡，并新增独立 Topic Drift / 锚点偏离观察：比较本轮 USER、必要承接上下文、reasoning 起点与后续窗口的主题连续性。只显示“建立中 / 稳定 / 轻微偏离 / 明显跑远”，不并入回环分数，也不自动停止生成。</p>
 
       <label class="checkbox_label">
         <input id="yrw_enabled" type="checkbox" />

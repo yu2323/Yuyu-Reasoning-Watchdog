@@ -1,9 +1,10 @@
 import { eventSource, event_types, saveSettingsDebounced, is_send_press } from '../../../../script.js';
 import { extension_settings, renderExtensionTemplateAsync } from '../../../extensions.js';
 import { Popup, POPUP_TYPE, POPUP_RESULT } from '../../../popup.js';
+import { createTopicDriftState, startTopicDrift, analyzeTopicDrift } from './topic-drift.js';
 
 const MODULE = 'yuyu_reasoning_watchdog';
-const EXTENSION_FOLDER = decodeURIComponent(new URL('.', import.meta.url).pathname.split('/').filter(Boolean).pop() || 'Yuyu-Reasoning-Watchdog-v0.3.3');
+const EXTENSION_FOLDER = decodeURIComponent(new URL('.', import.meta.url).pathname.split('/').filter(Boolean).pop() || 'Yuyu-Reasoning-Watchdog-v0.3.4');
 const POLL_MS = 520;
 const MAX_HISTORY = 12;
 const MAX_SAMPLES = 42;
@@ -74,6 +75,7 @@ const runtime = {
     hostIdleSince: 0,
     finishSource: '',
     truncation: { suspected: false, reason: '', finishReason: '' },
+    drift: createTopicDriftState(),
     baselineAssistantId: null,
     baselineAssistantMes: '',
 };
@@ -691,6 +693,7 @@ function poll() {
         runtime.lastReasoning = reasoning;
         runtime.lastReasoningChars = reasoning.length;
         runtime.analysis = analyzeReasoning(reasoning);
+        runtime.drift = analyzeTopicDrift(reasoning, runtime.drift, contentWords);
         pushSample(runtime.analysis);
         maybeToast(runtime.analysis);
         void refreshVisibleTokenCount(reasoning);
@@ -749,6 +752,7 @@ function startMonitoring() {
     runtime.visibleTokenScanAt = 0;
     runtime.visibleTokenSeq++;
     runtime.truncation = { suspected: false, reason: '', finishReason: '' };
+    runtime.drift = startTopicDrift(contentWords);
     const baseline = latestAssistantMessage();
     runtime.baselineAssistantId = baseline.id;
     runtime.baselineAssistantMes = String(baseline.msg?.mes || '');
@@ -770,6 +774,7 @@ function finishMonitoring(reasoningFromEvent = '', source = 'event') {
         runtime.lastReasoning = reasoningFromEvent;
         runtime.lastReasoningChars = reasoningFromEvent.length;
         runtime.analysis = analyzeReasoning(reasoningFromEvent);
+        runtime.drift = analyzeTopicDrift(reasoningFromEvent, runtime.drift, contentWords);
         pushSample(runtime.analysis);
     } else {
         poll();
@@ -815,6 +820,13 @@ function saveRunSummary() {
         reportedTokenSource: runtime.reportedTokenSource,
         score: runtime.analysis.score,
         level: runtime.analysis.level,
+        driftScore: runtime.drift?.score ?? 0,
+        driftLevel: runtime.drift?.level || 'unknown',
+        driftAffinity: runtime.drift?.affinity ?? 0,
+        driftDirectAffinity: runtime.drift?.directAffinity ?? 0,
+        driftChurn: runtime.drift?.churn ?? 0,
+        driftWindows: runtime.drift?.windowCount ?? 0,
+        driftAnchorSource: runtime.drift?.anchorSource || '',
         durationMs: runtime.analysis.elapsedMs,
         bodyChars: runtime.latestBodyChars,
         suspectedTruncation: !!runtime.truncation?.suspected,
@@ -842,7 +854,7 @@ function buildPopupContent() {
           <div class="yrw-brand-mark"><i class="fa-solid fa-brain"></i></div>
           <div class="yrw-brand-copy">
             <div class="yrw-title">思维监工</div>
-            <div class="yrw-subtitle">Reasoning Watchdog · v0.3.3</div>
+            <div class="yrw-subtitle">Reasoning Watchdog · v0.3.4</div>
           </div>
         </div>
         <div class="yrw-head-actions">
@@ -863,6 +875,7 @@ function buildPopupContent() {
             <strong id="yrw-token-main">未捕获</strong><span id="yrw-token-kind">卡片 T</span>
             <i class="yrw-usage-sep"></i><b id="yrw-visible-token">可见≈0 tok</b>
             <i class="yrw-usage-sep"></i><b id="yrw-reasoning-main">0 字符</b>
+            <i class="yrw-usage-sep"></i><b id="yrw-drift-main">锚点 0 · 建立中</b>
           </div>
         </div>
         <div class="yrw-score-card">
@@ -960,6 +973,7 @@ function buildPopupContent() {
             runtime.lastReasoning = '';
             runtime.lastReasoningChars = 0;
             runtime.visibleTokenCount = null;
+            runtime.drift = createTopicDriftState();
             runtime.truncation = { suspected: false, reason: '', finishReason: '' };
         }
         updateUI();
@@ -1170,6 +1184,7 @@ function updateUI() {
     ensureToolbarEntry();
     const s = settings();
     const a = runtime.analysis || emptyAnalysis();
+    const d = runtime.drift || createTopicDriftState();
     const level = a.level || 'normal';
 
     const toolbar = document.getElementById('yrw-toolbar-entry');
@@ -1179,7 +1194,7 @@ function updateUI() {
         toolbar.classList.toggle('yrw-panel-open', panelOpen);
         toolbar.title = panelOpen
             ? '关闭 Yuyu Reasoning Watchdog'
-            : `打开 Yuyu Watchdog · ${a.statusText || statusLabel(level)} · 回环 ${a.score || 0}`;
+            : `打开 Yuyu Watchdog · ${a.statusText || statusLabel(level)} · 回环 ${a.score || 0} · 锚点 ${d.score || 0}`;
     }
 
     const float = ensureFloat();
@@ -1205,6 +1220,9 @@ function updateUI() {
     setText('yrw-live-label', runtime.active ? '监控中' : '待机');
     setText('yrw-badge', a.statusText || statusLabel(level));
     setText('yrw-reasoning-main', `${formatK(a.reasoningChars || 0)} 字符`);
+    setText('yrw-drift-main', `锚点 ${Math.round(d.score || 0)} · ${d.label || '建立中'}`);
+    const driftMain = q('yrw-drift-main');
+    if (driftMain) driftMain.title = `${d.note || ''}${d.anchorSource ? `｜锚点来源：${d.anchorSource}` : ''}`;
     const reported = readReportedThinkingTokens();
     setText('yrw-token-main', reported !== null ? `${formatK(reported)}T` : '未捕获');
     setText('yrw-token-kind', reported !== null ? '卡片报告' : '卡片 T');
@@ -1369,6 +1387,7 @@ function bindEvents() {
             runtime.lastReasoning = reasoning;
             runtime.lastReasoningChars = reasoning.length;
             runtime.analysis = analyzeReasoning(reasoning);
+            runtime.drift = analyzeTopicDrift(reasoning, runtime.drift, contentWords);
             if (Number.isFinite(Number(duration)) && Number(duration) > 0) runtime.analysis.elapsedMs = Number(duration);
             pushSample(runtime.analysis);
             readReportedThinkingTokens();
@@ -1398,5 +1417,5 @@ jQuery(async () => {
     }, 2500);
     setInterval(syncFloatOcclusion, 650);
 
-    console.info('[YRW] Yuyu Reasoning Watchdog v0.3.3 loaded (native Popup + native extension drawer + one-shot anchor guide experiment).');
+    console.info('[YRW] Yuyu Reasoning Watchdog v0.3.4 loaded (native Popup + native extension drawer + one-shot anchor guide experiment).');
 });

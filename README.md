@@ -2,11 +2,12 @@
 
 SillyTavern 移动端优先的 reasoning 监工实验插件。
 
-当前版本：**v0.3.3**
+当前版本：**v0.3.4**
 
 ## 当前能力
 
 - 实时读取 SillyTavern 可见 reasoning 文本，统计字符、5-gram 重复、信息新颖度、标题回环和综合回环指数。
+- 独立计算 Topic Drift / 锚点偏离：以本轮 USER、必要承接上下文和 reasoning 起点建立本地锚点，观察后续窗口是否持续远离；不并入回环指数。
 - 读取 ST 保存的 `reasoning_duration` 作为完成后的思考耗时优先口径。
 - 尝试读取宿主/主题消息卡片显示的 `xxxxT`，单独标记为“卡片报告 T”；不会把它冒充 Gemini 官方 `thoughtsTokenCount`。
 - 通过 `CHAT_COMPLETION_PROMPT_READY` 支持单轮“思维题卡”实验；题卡只影响当前请求，不写入聊天历史，不修改 Yuyu 预设。
@@ -26,6 +27,15 @@ SillyTavern 移动端优先的 reasoning 监工实验插件。
 5. 安装后刷新页面。
 
 以后更新直接在 SillyTavern 的扩展管理里对本扩展执行更新，不需要重新下载 ZIP。
+
+## v0.3.4 Topic Drift 观察版
+
+- 保留 v0.3.3 锚定题卡、原回环算法、UI 基线和 warn-only 边界。
+- 新增独立 `topic-drift.js`：只在浏览器本地读取当前聊天与可见 reasoning，不额外调用模型。
+- 本轮锚点优先取最新 USER；当 USER 很短时，只补上一轮 assistant 正文尾部；reasoning 起始段作为第二锚点，避免“继续 / 然后呢”这类短输入失去上下文。
+- 后续 reasoning 按窗口观察锚点亲和度、持续丢失与主题换轨，输出 `建立中 / 稳定 / 轻微偏离 / 明显跑远`。
+- 锚点偏离是独立观察值，不写进原有回环指数，不触发 Toast 或 `stopGeneration()`。
+- 当前算法仍是本地词簇近似，不等于真正语义 embedding；本版目标是收集“回环正常但人工看已跑远”的实机样本。
 
 ## v0.3.3 重点
 

@@ -6,7 +6,7 @@
   "js": "index.js",
   "css": "style.css",
   "author": "Yuyu Lab",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "homePage": "https://github.com/yu2323/Yuyu-Reasoning-Watchdog",
   "auto_update": false
 }
